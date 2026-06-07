@@ -24,12 +24,13 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar, List, Literal, Optional, Tuple, Union, overload
+from typing import TYPE_CHECKING, Any, ClassVar, List, Literal, Optional, Tuple, Union, Dict, overload
 
 from .enums import ButtonStyle, ComponentType, InteractionType, TextStyle, try_enum
 from .interactions import _wrapped_interaction
 from .partial_emoji import PartialEmoji, _EmojiTag
 from .utils import MISSING, _generate_nonce, get_slots
+import aiohttp
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -194,7 +195,6 @@ class TextDisplay(Component):
         return 10
 
     def to_dict(self) -> 'ComponentInteractionData':  # type: ignore[override]
-        # TextDisplay is a non-interactive content component
         payload = {
             'type': 10,
             'content': self.content,
@@ -230,7 +230,6 @@ class Container(Component):
 
     def __init__(self, data: 'ComponentPayload', message: 'Message'):
         self.message = message
-        # Preserve raw data for forward-compatibility
         self.data: dict = dict(data)
         self.children: List[Component] = []
         for component_data in data.get('components', []) or []:
@@ -258,7 +257,6 @@ class Container(Component):
             payload['spoiler'] = True
         if self.id is not None:
             payload['id'] = self.id
-        # Merge any unknown original fields (excluding ones we already set)
         for k, v in self.data.items():
             if k not in payload and k not in {'type'}:
                 payload[k] = v
@@ -335,6 +333,10 @@ class Container(Component):
             if isinstance(comp, FileComponent):
                 out.append(comp)
         return out
+
+    @property
+    def raw_children(self) -> List[Component]:
+        return list(self.children)
 
 
 class Section(Component):
@@ -424,48 +426,99 @@ class Thumbnail(Component):
 
     def __init__(self, data: 'ComponentPayload', message: 'Message'):
         self.message = message
-        # Preserve raw to avoid losing future fields we don't explicitly model
         self.data: dict = dict(data)
         self.id: Optional[int] = data.get('id')
-        # Known common fields
         self.url: Optional[str] = data.get('url') or data.get('image_url')
         self.width: Optional[int] = data.get('width')
         self.height: Optional[int] = data.get('height')
 
     @property
     def type(self) -> int:
-        # Discord assigns 11 for image/thumbnail accessory in Components v2
         return 11
 
     def to_dict(self) -> 'ComponentInteractionData':  # type: ignore[override]
         payload: dict = {'type': 11}
         if self.id is not None:
             payload['id'] = self.id
-        # Only include known fields if present; retain any unknowns from original
         if self.url is not None:
             payload['url'] = self.url
         if self.width is not None:
             payload['width'] = self.width
         if self.height is not None:
             payload['height'] = self.height
-        # Merge any extra fields that were present originally but not modeled
         for k, v in self.data.items():
             if k not in payload and k not in {'type'}:
                 payload[k] = v
         return payload
 
 
+class MediaGalleryMedia:
+    """Represents the actual media content inside a gallery item."""
+    __slots__ = (
+        'id', 'url', 'proxy_url', 'width', 'height', 'placeholder', 
+        'placeholder_version', 'content_type', 'loading_state', 'flags', 'attachment_id'
+    )
+
+    def __init__(self, data: Dict[str, Any]):
+        self.id: Optional[str] = data.get('id')
+        self.url: Optional[str] = data.get('url')
+        self.proxy_url: Optional[str] = data.get('proxy_url')
+        self.width: Optional[int] = data.get('width')
+        self.height: Optional[int] = data.get('height')
+        self.placeholder: Optional[str] = data.get('placeholder')
+        self.placeholder_version: Optional[int] = data.get('placeholder_version')
+        self.content_type: Optional[str] = data.get('content_type')
+        self.loading_state: Optional[int] = data.get('loading_state')
+        self.flags: Optional[int] = data.get('flags')
+        self.attachment_id: Optional[str] = data.get('attachment_id')
+
+    async def read(self) -> bytes:
+        """Downloads the media from the URL and returns the raw bytes."""
+        if not self.url:
+            raise ValueError("No URL found for this media item.")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(self.url) as response:
+                if response.status != 200:
+                    raise Exception(f"Failed to download image. HTTP Status: {response.status}")
+                return await response.read()
+
+    def to_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self.__slots__ if getattr(self, k) is not None}
+
+
+class MediaGalleryItem:
+    """Represents a single item/post in a Media Gallery."""
+    __slots__ = ('media', 'description', 'spoiler')
+
+    def __init__(self, data: Dict[str, Any]):
+        media_data = data.get('media', {})
+        self.media: Optional[MediaGalleryMedia] = MediaGalleryMedia(media_data)
+        self.description: Optional[str] = data.get('description')
+        self.spoiler: bool = data.get('spoiler', False)
+
+    def to_dict(self) -> dict:
+        payload = {
+            'description': self.description,
+            'spoiler': self.spoiler
+        }
+        if self.media:
+            payload['media'] = self.media.to_dict()
+        return payload
+    
 class MediaGallery(Component):
     """Represents a v2 Media Gallery content component (type 12)."""
 
-    __slots__ = ('items', 'id')
+    __slots__ = ('items', 'id', 'message')
 
     __repr_info__: ClassVar[Tuple[str, ...]] = ('id',)
 
     def __init__(self, data: 'ComponentPayload', message: 'Message'):
         self.message = message
         self.id: Optional[int] = data.get('id')
-        self.items: List[dict] = list(data.get('items', []) or [])
+        
+        raw_items = data.get('items', []) or []
+        self.items: List[MediaGalleryItem] = [MediaGalleryItem(item) for item in raw_items]
 
     @property
     def type(self) -> int:
@@ -474,7 +527,7 @@ class MediaGallery(Component):
     def to_dict(self) -> 'ComponentInteractionData':  # type: ignore[override]
         payload: dict = {
             'type': 12,
-            'items': list(self.items),
+            'items': [item.to_dict() for item in self.items], 
         }
         if self.id is not None:
             payload['id'] = self.id
